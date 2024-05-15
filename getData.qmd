@@ -1,0 +1,175 @@
+---
+title: "getData"
+output: html_document
+date: "2024-04-23"
+---
+
+```{r}
+# devtools::install_github("kaijagahm/vultureUtils")
+library(vultureUtils)
+library(tidyverse)
+library(here)
+library(readxl)
+```
+
+## Load who's who
+
+```{r}
+ww <- read_excel(here("./whoswho_vultures_20240109_new.xlsx")) 
+```
+
+## Authenticate to Movebank
+
+```{r}
+# Load in movebank credentials password file; create login object; remove password file. 
+base::load(here::here("movebankCredentials/pw.Rda"))
+MB.LoginObject <- move::movebankLogin(username = "kaijagahm", 
+                                      password = pw)
+rm(pw)
+```
+
+## Download data
+
+```{r}
+data_movebank <- downloadVultures(loginObject = MB.LoginObject,
+                           removeDup = T, dfConvert = T, quiet = T, 
+                           dateTimeStartUTC = "2021-10-10 00:00",
+                           dateTimeEndUTC = "2021-10-24 00:00")
+```
+
+## Join `Nili_id`s
+
+```{r}
+ww_tojoin <- ww %>% dplyr::select(Nili_id, Movebank_id) %>% dplyr::distinct() # pull out just the names columns, nothing else, and remove any duplicates
+
+# join by movebank ID
+data_fixednames <- dplyr::left_join(data_movebank, ww_tojoin, 
+                        by = c("local_identifier" = "Movebank_id"))
+```
+
+## Remove unnecessary features
+
+```{r}
+# Input features to the model
+features <- c("local_identifier", "acceleration_raw_x", "acceleration_raw_y", "acceleration_raw_z", "barometric_height", "external_temperature", "ground_speed", "heading", "height_above_msl", "location_lat", "location_long",  "timestamp")
+
+# Remove unnecessary features
+timeseries_data <- data_fixednames %>% select(all_of(features))
+
+```
+
+## Augment features (TODO: GPS metrics, follow literature)
+
+```{r}
+
+```
+
+## Add target label and reshape data
+
+```{r}
+
+## Fill in missing values
+# Create sequence of 10 minute intervals from first to last date
+entire_time <- data.frame(rounded_timestamp = seq.POSIXt(from=lubridate::round_date(min(timeseries_data$timestamp), "10 minute"), to=lubridate::round_date(max(timeseries_data$timestamp), "10 minute"), "10 min"))
+# Create rounded timestamp label for each GPS point
+timeseries_data <- timeseries_data %>% 
+  mutate(rounded_timestamp = lubridate::round_date(timestamp, unit="10 minute"))
+# data frame to join containing rounded timstamp + ID pairs
+all_vulture_times <- cbind(data.frame(rep(unique(timeseries_data$local_identifier), each = nrow(entire_time))),entire_time)
+colnames(all_vulture_times) <- c("local_identifier", "rounded_timestamp")
+# augment dataset by adding 0s for missing rounded time values for entire season
+timeseries_data <- full_join(all_vulture_times, timeseries_data, by=c("local_identifier", "rounded_timestamp")) %>%
+  mutate(across(where(is.numeric), ~ replace_na(.x, 0)))
+
+# Group data to get correct number of labels (NOT USED ATM : TIMESTAMPS ARE FLOORED TO CURRENT DAY)
+flight_length_days <- 1 # days per data point
+timegroup <- findInterval(timeseries_data$rounded_timestamp, seq(min(entire_time$rounded_timestamp), max(entire_time$rounded_timestamp), by = paste(flight_length_days, "days"))) 
+
+# IDS of confirmed poisoned vultures
+kina_valley_ids <- c("E07w", "E14w", "T69b", "T56b", "T18w", "T83b", "A77w", "T66w")
+# Random sample of non-poisoned vultures (length = poisoned - 2)
+trackIds <- unique(data_fixednames$local_identifier)
+not_poisoned_ids <- sample(trackIds[!(trackIds %in% kina_valley_ids)], length(kina_valley_ids) - 3)
+
+# Make groupings with label (NOTE: currently vultures considered poisoned are considered poisoned for the entire flight path)
+
+# Remake groupings without label and timestamp (arrange by increasing time)
+train_test_data <- timeseries_data %>%
+  mutate(poisoned = local_identifier %in% kina_valley_ids,
+         timegroup = floor_date(rounded_timestamp, "day")) %>%
+  filter(local_identifier %in% kina_valley_ids | local_identifier %in% not_poisoned_ids) %>%
+  group_by(local_identifier, timegroup) %>% 
+  arrange(timestamp) %>% 
+  select(-c("timestamp")) %>%
+  group_map(~.x)
+
+# Remove days containing too few points and remove duplicate timestamps
+
+train_test_data <- Filter(function(x) nrow(x) >= 144, train_test_data)
+
+remove_duplicates <- function(day){
+  day[!duplicated(day$rounded_timestamp), ] %>%
+    arrange(rounded_timestamp) %>% 
+    select(-c("rounded_timestamp"))
+}
+
+train_test_data <- lapply(train_test_data, remove_duplicates)
+
+# Get targets
+target_data <- sapply(train_test_data, function(x) ifelse(x$poisoned[1], 1, 0))
+
+# Remove target label
+train_test_data <- train_test_data %>% lapply(select, -c("poisoned"))
+
+# Reformat into 3D matrix
+# train_test_3d <- str2str::ld2a(train_test_data, dim.order=c(3, 1, 2))
+
+# Check for bias among targets
+sum(target_data)/length(target_data)
+
+```
+
+## Split into training, validation, and testing
+
+```{r}
+library(caret)
+
+train_valid_indices <- createDataPartition(target_data, times=1, p=.8, list=F)
+X_test <- train_test_data[-train_valid_indices]
+y_test <- target_data[-train_valid_indices]
+
+train_indicies <- createDataPartition(target_data[train_valid_indices], times=1, p=.9, list=F)
+X_train <- train_test_data[train_indicies]
+y_train <- target_data[train_indicies]
+X_valid <- train_test_data[-train_indicies]
+y_valid <- target_data[-train_indicies]
+```
+
+## Export to python with feather
+
+```{r}
+
+# Reshape and save
+
+# write.table(str2str::ld2a(X_train, dim.order=c(3, 1, 2)), file="X_train.csv")
+# write.table(str2str::ld2a(X_valid, dim.order=c(3, 1, 2)), file="X_valid.csv")
+# write.table(str2str::ld2a(X_test, dim.order=c(3, 1, 2)), file="X_test.csv")
+
+
+library(feather) 
+
+sapply(seq_along(1:length(X_train)), 
+       function(i) write_feather(X_train[[i]], 
+                                 paste0("./Data/training/","DF",i,".feather")))
+write.csv(y_train, file="./Data/training/y_train.csv")
+
+sapply(seq_along(1:length(X_valid)), 
+       function(i) write_feather(X_valid[[i]], 
+                                 paste0("./Data/valid/","DF",i,".feather")))
+write.csv(y_valid, file="./Data/valid/y_valid.csv")
+
+sapply(seq_along(1:length(X_test)), 
+       function(i) write_feather(X_test[[i]], 
+                                 paste0("./Data/test/","DF",i,".feather")))
+write.csv(y_test, file="./Data/test/y_test.csv")
+```
